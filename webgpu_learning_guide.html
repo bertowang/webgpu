@@ -157,6 +157,7 @@
             <li><a href="#appendix-projects">13. 开源学习工程</a></li>
             <li><a href="#api-philosophy">14. 设计哲学：WebGPU 与 OpenGL / Metal / Vulkan</a></li>
             <li><a href="#wgsl-syntax">15. WGSL 语法入门</a></li>
+            <li><a href="#dev-patterns">16. 可复用开发模式速查</a></li>
         </ul>
     </nav>
 
@@ -176,6 +177,12 @@
                 <tr><td>计算着色器</td><td>需扩展</td><td>一等公民（compute pipeline）</td></tr>
                 <tr><td>着色器语言</td><td>GLSL</td><td>WGSL（类型安全、可静态验证）</td></tr>
             </table>
+
+            <h3>出现背景：从“画图 API”到“GPU 通用计算 API”</h3>
+            <p>WebGPU 不是 WebGL 的简单升级，而是把 Vulkan / Metal / D3D12 的现代 GPU 思想（显式管线、资源绑定、命令缓冲、计算着色器、多线程编码）带进浏览器，并用安全验证与 WGSL 做统一封装。核心目标是：让 Web 应用既能低开销渲染，也能把 GPU 当作并行计算设备使用。</p>
+
+            <h3>AI 场景：适合轻量推理与教学实验</h3>
+            <p>借助 compute shader、storage buffer 和 workgroup，WebGPU 可以实现矩阵乘法、Softmax、Attention 等并行算子，适合浏览器端推理、实时图像处理、AI 教学与本地隐私计算；TensorFlow.js、ONNX Runtime Web、WebLLM 等生态也已支持。但它不是 CUDA 的完整替代：显存 / binding size 有限、<code>f16</code> 依赖设备支持、调试工具较弱，大模型训练与极致性能仍应使用原生 CUDA / Metal / Vulkan。</p>
 
             <div class="tip"><b>心智模型</b>：把 WebGPU 想象成一条<span class="kbd">工厂流水线</span>。你先把原料（顶点数据）放进仓库（Buffer），设计好图纸（Pipeline），写好工人指令（WGSL），然后把订单（CommandBuffer）一次性交给调度中心（Queue）执行。</div>
 
@@ -1328,6 +1335,138 @@ let c = mix(colorA, colorB, t);           // 线性插值</code></pre>
                 <tr><td>试图写 <code>var&lt;uniform&gt;</code></td><td>需要写就用 <code>var&lt;storage, read_write&gt;</code></td><td>uniform 在所有线程间共享，必须只读。</td></tr>
             </table>
             <div class="note">回到 <a href="#wgsl">5.3 节</a>看完整顶点 / 片段着色器，再看 <a href="#compute">第 8 章</a>的 compute kernel，你会发现它们都只是这些语法规则的组合。</div>
+        </section>
+
+        <!-- ========== 16 附录：可复用开发模式速查 ========== -->
+        <section class="chapter" id="dev-patterns">
+            <h2>16. 可复用开发模式速查</h2>
+            <p class="lead">WebGPU 是显式 API，新手最容易陷在样板代码里。先把初始化、管线、帧流程固定成套路，再把注意力留给 WGSL、管线状态和数据流。</p>
+            <div class="note">核心原则：<b>资源 / 管线 / 布局只在初始化时创建；每帧只更新 buffer、切换 BindGroup、提交命令。</b></div>
+
+            <h3>16.1 八种值得先复用的模式</h3>
+            <table>
+                <tr><th>模式</th><th>解决什么</th><th>落地方式</th></tr>
+                <tr><td>设备 / 上下文外观</td><td>重复 <code>requestAdapter → requestDevice → configure</code></td><td>封一个 <code>GpuApp.init(canvas)</code>，全局只留一个 <code>device / context / format</code>。</td></tr>
+                <tr><td>资源工厂</td><td><code>createBuffer</code> 参数多、易漏 <code>usage</code></td><td>写 <code>buffer(size, usage, label)</code>，统一对齐、加 <code>label</code>、集中 <code>destroy()</code>。</td></tr>
+                <tr><td>Pipeline 缓存</td><td>每帧重建管线开销大</td><td>用 <code>Map&lt;string, GPURenderPipeline&gt;</code>；key 含 shader、顶点格式、目标格式、深度 / 图元状态。</td></tr>
+                <tr><td>BindGroup 槽位约定</td><td>WGSL 的 <code>@group/@binding</code> 与 JS 对不上</td><td>固定 <code>group0=帧 uniform</code>、<code>group1=材质</code>、<code>group2=物体</code>；新手期先用 <code>layout:'auto'</code>。</td></tr>
+                <tr><td>Uniform 打包器</td><td>结构体对齐坑多</td><td>一个 <code>FrameUniforms</code> + <code>Float32Array</code>，每帧只 <code>queue.writeBuffer</code> 一次。</td></tr>
+                <tr><td>帧模板方法</td><td>帧流程容易漏步骤</td><td>固定 <code>beginRenderPass → setPipeline → setBindGroup → draw → submit</code>。</td></tr>
+                <tr><td>Compute 任务函数</td><td>compute 样板重复</td><td>封 <code>runCompute(module, bindings, workgroups)</code>，storage buffer 尽量复用。</td></tr>
+                <tr><td>验证与回退</td><td>设备能力 / 浏览器差异</td><td>判空 <code>navigator.gpu</code>，关键阶段用 <code>pushErrorScope('validation')</code>，必要时回退 WebGL / CPU。</td></tr>
+            </table>
+
+            <h3>16.2 最小脚手架</h3>
+            <p>下面用 TypeScript 把"设备初始化、管线缓存、资源上传、帧提交"封成基类，子类只写自己的管线和绘制逻辑。</p>
+            <div class="code-lang">TypeScript</div>
+            <pre><code>class GpuApp {
+  protected device!: GPUDevice;
+  protected context!: GPUCanvasContext;
+  protected format!: GPUTextureFormat;
+  private pipelines = new Map&lt;string, GPURenderPipeline&gt;();
+
+  async init(canvas: HTMLCanvasElement) {
+    const adapter = await navigator.gpu?.requestAdapter();
+    if (!adapter) throw new Error('当前浏览器不支持 WebGPU');
+
+    this.device = await adapter.requestDevice();
+    this.context = canvas.getContext('webgpu') as GPUCanvasContext;
+    this.format = navigator.gpu.getPreferredCanvasFormat();
+    this.context.configure({
+      device: this.device,
+      format: this.format,
+      alphaMode: 'opaque',
+    });
+  }
+
+  protected pipeline(key: string, create: () =&gt; GPURenderPipeline) {
+    let p = this.pipelines.get(key);
+    if (!p) this.pipelines.set(key, p = create());
+    return p;
+  }
+
+  protected buffer(size: number, usage: GPUBufferUsageFlags, label: string) {
+    return this.device.createBuffer({
+      label,
+      size: Math.ceil(size / 4) * 4,
+      usage,
+    });
+  }
+
+  protected upload(buf: GPUBuffer, data: ArrayBufferView) {
+    this.device.queue.writeBuffer(buf, 0, data);
+  }
+
+  frame(draw: (pass: GPURenderPassEncoder) =&gt; void) {
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: this.context.getCurrentTexture().createView(),
+        clearValue: { r: 0.05, g: 0.06, b: 0.08, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+    });
+
+    draw(pass);
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+  }
+}</code></pre>
+            <div class="note">示例省略了 TypeScript 的 WebGPU 类型断言；实际项目可像<a href="#init">第 4 章</a>那样用 <code>as unknown as ...</code> 补齐类型。</div>
+
+            <h3>16.3 新手使用顺序</h3>
+            <div class="flow">
+                <span class="node cpu">GpuApp 初始化</span><span class="arrow">→</span>
+                <span class="node cpu">三角形</span><span class="arrow">→</span>
+                <span class="node cpu">uniform + BindGroup</span><span class="arrow">→</span>
+                <span class="node cpu">Pipeline 缓存</span><span class="arrow">→</span>
+                <span class="node gpu">compute helper</span><span class="arrow">→</span>
+                <span class="node gpu">兼容回退 / 热重载</span>
+            </div>
+            <div class="tip"><b>三条记忆点</b>：① 只在初始化时创建资源、管线、布局；② 先 <code>layout:'auto'</code>，别急着手写 <code>BindGroupLayout</code>；③ 每个对象都加 <code>label</code>，排错会轻松很多。</div>
+
+            <h3 id="dev-patterns-projects">16.4 参考开源工程</h3>
+            <p>按"先抄骨架 → 再看引擎 → 最后看 AI / Compute"列出 GitHub 上可直接参考的工程，正好对应 16.1 的模式。</p>
+
+            <p><b>先抄骨架：官方与教程</b></p>
+            <table>
+                <tr><th>项目</th><th>重点看什么</th></tr>
+                <tr><td><a href="https://github.com/webgpu/webgpu-samples">webgpu/webgpu-samples</a></td><td>官方样例；<code>helloTriangle</code> / <code>rotatingCube</code> / <code>computeBoids</code> 就是第 16.2 脚手架的真实版。</td></tr>
+                <tr><td><a href="https://github.com/gpuweb/gpuweb">gpuweb/gpuweb</a></td><td>规范原文，查 API 语义与边界。</td></tr>
+                <tr><td><a href="https://github.com/greggman/webgpu-fundamentals">greggman/webgpu-fundamentals</a></td><td>教程配套代码，尤其适合看 Uniform 对齐与 BindGroup 坑。</td></tr>
+            </table>
+
+            <p><b>轻量框架与引擎</b></p>
+            <table>
+                <tr><th>项目</th><th>对应模式</th></tr>
+                <tr><td><a href="https://github.com/vercel-labs/vgpu">vercel-labs/vgpu</a></td><td>设备外观、资源工厂、WGSL 模块化；同一 shader 可跑浏览器 / Node / CI。</td></tr>
+                <tr><td><a href="https://github.com/Orillusion/orillusion">Orillusion/orillusion</a></td><td>纯 WebGPU TypeScript 引擎；看 Pipeline 缓存、Pass 组织、资源生命周期。</td></tr>
+                <tr><td><a href="https://github.com/playcanvas/engine">playcanvas/engine</a></td><td>WebGL2 / WebGPU 双后端；看验证与回退策略。</td></tr>
+                <tr><td><a href="https://github.com/mrdoob/three.js">three.js（WebGPURenderer）</a></td><td>大规模材质与渲染管线管理。</td></tr>
+                <tr><td><a href="https://github.com/BabylonJS/Babylon.js">BabylonJS/Babylon.js</a></td><td>成熟 Engine 抽象与生产级能力探测。</td></tr>
+                <tr><td><a href="https://github.com/gfx-rs/wgpu">gfx-rs/wgpu</a></td><td>Rust 安全封装；理解显式 API 如何被统一。</td></tr>
+            </table>
+
+            <p><b>AI / Compute</b></p>
+            <table>
+                <tr><th>项目</th><th>重点看什么</th></tr>
+                <tr><td><a href="https://github.com/mlc-ai/web-llm">mlc-ai/web-llm</a></td><td>浏览器 LLM；compute 管线、KV Cache、多 dispatch 组织。</td></tr>
+                <tr><td><a href="https://github.com/tensorflow/tfjs">tensorflow/tfjs（WebGPU backend）</a></td><td>算子到 WGSL 的映射，Uniform / Storage 打包。</td></tr>
+                <tr><td><a href="https://github.com/microsoft/onnxruntime">microsoft/onnxruntime（WebGPU EP）</a></td><td>Kernel 缓存与执行计划优化。</td></tr>
+                <tr><td><a href="https://github.com/huggingface/kernels">huggingface/kernels</a></td><td>200+ WebGPU kernel，每个带 manifest / 测试 / benchmark / WGSL 模板。</td></tr>
+                <tr><td><a href="https://github.com/svenflow/model-to-webgpu">svenflow/model-to-webgpu</a></td><td>模型转零依赖 WGSL compute 工程，端到端看 dispatch。</td></tr>
+            </table>
+
+            <div class="note"><b>模式对照</b>：设备 / 资源工厂 → <code>webgpu-samples</code>、<code>vgpu</code>；Pipeline 缓存 / Pass → <code>Orillusion</code>、<code>playcanvas</code>；BindGroup 槽位 → <code>webgpu-samples</code>；Uniform 打包 → <code>webgpu-fundamentals</code>、<code>tfjs-backend-webgpu</code>；Compute 任务函数 → <code>huggingface/kernels</code>、<code>web-llm</code>、<code>model-to-webgpu</code>；验证与回退 → <code>playcanvas</code>、<code>Babylon.js</code>。</div>
+
+            <div class="flow">
+                <span class="node cpu">webgpu-samples</span><span class="arrow">→</span>
+                <span class="node cpu">vgpu</span><span class="arrow">→</span>
+                <span class="node cpu">Orillusion / playcanvas</span><span class="arrow">→</span>
+                <span class="node gpu">huggingface/kernels</span><span class="arrow">→</span>
+                <span class="node gpu">web-llm</span>
+            </div>
         </section>
     </main>
 
