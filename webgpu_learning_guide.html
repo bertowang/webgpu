@@ -153,6 +153,7 @@
             <li><a href="#pitfalls">11. 常见陷阱</a></li>
             <li><a href="#glossary">12. 术语表</a></li>
             <li><a href="#appendix-projects">13. 开源学习工程</a></li>
+            <li><a href="#api-philosophy">14. 设计哲学：WebGPU 与 OpenGL / Metal / Vulkan</a></li>
         </ul>
     </nav>
 
@@ -226,11 +227,15 @@
         <section class="chapter" id="init">
             <h2>4. 初始化设备与上下文</h2>
             <p class="lead">所有 WebGPU 程序的第一步：拿设备、配画布。</p>
-            <pre><code>        if (!gpuApi) throw new Error('当前浏览器不支持 WebGPU');
+            <pre><code>        // 1) 获取 WebGPU 入口；旧浏览器没有 navigator.gpu
+        const gpuApi = (navigator as unknown as { gpu?: GpuLike }).gpu;
+        if (!gpuApi) throw new Error('当前浏览器不支持 WebGPU');
+        // 2) 请求适配器与设备；device 是创建所有 GPU 资源的入口
         const adapter = await gpuApi.requestAdapter();
         if (!adapter) throw new Error('未找到 WebGPU 适配器');
         this.device = await adapter.requestDevice();
 
+        // 3) 配置画布：设备 + 平台推荐格式
         this.resizeCanvas();
         const context = this.canvas.getContext('webgpu') as unknown as {
             configure(desc: unknown): void;
@@ -239,7 +244,7 @@
         this.context = context;
         const format = gpuApi.getPreferredCanvasFormat();
         this.context.configure({ device: this.device, format, alphaMode: 'opaque' });</code></pre>
-            <div class="note"><code>getPreferredCanvasFormat()</code> 返回平台偏好格式（通常 <code>bgra8unorm</code>），避免通道顺序转换开销。<code>alphaMode:'opaque'</code> 让合成阶段更快。</div>
+            <div class="note"><b><code>gpuApi</code></b>：从 <code>navigator.gpu</code> 读取，是 WebGPU 的入口对象。示例用 <code>as unknown as { gpu?: GpuLike }</code> 做类型断言，是因为 TypeScript 原生 DOM 类型不一定包含 WebGPU 定义；<code>GpuLike</code> 是示例自定义的最小接口，<code>gpu?</code> 表示浏览器可能不支持，所以下一行先判空。<br><b><code>getPreferredCanvasFormat()</code></b>：返回平台偏好格式（通常 <code>bgra8unorm</code>），避免通道顺序转换开销。<code>alphaMode:'opaque'</code> 让合成阶段更快。</div>
         </section>
 
         <!-- ========== 5 渲染机制入门（5.1–5.4） ========== -->
@@ -346,6 +351,7 @@
             <pre><code>// 顶点着色器：只把位置原样输出，不做变换
 @vertex
 fn vs(@location(0) pos : vec3f) -&gt; @builtin(position) vec4f {
+    // 输出裁剪空间坐标；这里假设 pos 已经在 NDC 附近
     return vec4f(pos, 1.0);
 }
 
@@ -419,7 +425,8 @@ fn fs() -&gt; @location(0) vec4f {
 
             <h3 id="buffers">5.2 缓冲区与绑定：把数据送进 GPU</h3>
             <p class="lead">把 JS 数据上传为 GPU 资源，并建立着色器可见的绑定。</p>
-            <pre><code>        const vertexBuffer = this.device.createBuffer({
+            <pre><code>        // 顶点缓冲：静态形状 + 颜色，每个顶点一份
+        const vertexBuffer = this.device.createBuffer({
             size: vertexData.byteLength,
             usage: gpuGlobal.GPUBufferUsage.VERTEX | gpuGlobal.GPUBufferUsage.COPY_DST,
             mappedAtCreation: true
@@ -427,6 +434,7 @@ fn fs() -&gt; @location(0) vec4f {
         new Float32Array(vertexBuffer.getMappedRange()).set(vertexData);
         vertexBuffer.unmap();
 
+        // 索引缓冲：复用顶点，减少重复数据
         const indexBuffer = this.device.createBuffer({
             size: indices.byteLength,
             usage: gpuGlobal.GPUBufferUsage.INDEX | gpuGlobal.GPUBufferUsage.COPY_DST,
@@ -435,14 +443,18 @@ fn fs() -&gt; @location(0) vec4f {
         new Uint16Array(indexBuffer.getMappedRange()).set(indices);
         indexBuffer.unmap();
 
+        // Uniform 缓冲：所有顶点共享的 MVP 矩阵，每帧更新
         this.uniformBuffer = this.device.createBuffer({
             size: 64,
             usage: gpuGlobal.GPUBufferUsage.UNIFORM | gpuGlobal.GPUBufferUsage.COPY_DST
         });
+        // BindGroup：把 uniformBuffer 绑定到 @group(0) @binding(0)
         this.bindGroup = this.device.createBindGroup({
             layout: this.pipeline.getBindGroupLayout(0),
             entries: [{ binding: 0, resource: { buffer: this.uniformBuffer } }]
         });</code></pre>
+            <p><b>顶点缓冲</b>（上面代码中的 <code>vertexBuffer</code>）：存放静态的"形状 + 颜色"数据，每个顶点一份；<code>usage</code> 标记为 <code>VERTEX</code>，通过 <code>mappedAtCreation</code> 一次性写入。</p>
+            <p><b>Uniform 缓冲</b>（上面代码中的 <code>uniformBuffer</code>）：存放所有顶点共享的参数，本例是 MVP 矩阵；它通过 <code>bindGroup</code> 绑定给着色器，而不是放进顶点缓冲。</p>
             <div class="warn"><b>常见坑</b>：<code>mappedAtCreation: true</code> 只适合一次性上传静态数据；每帧变化的 MVP 矩阵用 <code>queue.writeBuffer()</code> 更新同一个 Buffer，不要每帧重建。</div>
 
             <h3 id="wgsl">5.3 WGSL：顶点与片段的计算</h3>
@@ -455,8 +467,10 @@ fn fs() -&gt; @location(0) vec4f {
             </table>
             <p><b>本例 WGSL 代码</b></p>
             <pre><code>            code: `
+                // 所有顶点共享的 Uniform：MVP 矩阵
                 struct Uniforms { mvp: mat4x4f };
                 @group(0) @binding(0) var&lt;uniform&gt; uniforms: Uniforms;
+                // 顶点着色器输出：位置 + 颜色，交给光栅化和片段阶段
                 struct VertexOutput {
                     @builtin(position) position : vec4f,
                     @location(0) color : vec4f
@@ -464,26 +478,32 @@ fn fs() -&gt; @location(0) vec4f {
                 @vertex
                 fn vertex_main(@location(0) position : vec3f, @location(1) color : vec3f) -&gt; VertexOutput {
                     var out: VertexOutput;
+                    // 模型空间 → 裁剪空间
                     out.position = uniforms.mvp * vec4f(position, 1.0);
+                    // 顶点颜色原样传给片段阶段
                     out.color = vec4f(color, 1.0);
                     return out;
                 }
                 @fragment
                 fn fragment_main(input : VertexOutput) -&gt; @location(0) vec4f {
+                    // 输出到画布的 0 号颜色附件
                     return input.color;
                 }</code></pre>
             <div class="tip"><code>@location(0/1)</code> 必须与 JS 侧 <code>vertex.buffers.attributes</code> 的 <code>shaderLocation</code> 一一对应；<code>var&lt;uniform&gt;</code> 是所有顶点共享的只读数据。</div>
 
             <h3 id="pipeline">5.4 渲染管线：把状态装配成流水线</h3>
             <p class="lead">管线把着色器与固定状态组装成一条绘制流水线。</p>
-            <pre><code>        this.pipeline = this.device.createRenderPipeline({
+            <pre><code>        // layout:'auto' 让 WebGPU 根据 WGSL 自动推导 BindGroupLayout
+        this.pipeline = this.device.createRenderPipeline({
             layout: 'auto',
             vertex: {
                 module: shader,
                 entryPoint: 'vertex_main',
+                // 每个顶点 6 个 float：位置 3 + 颜色 3
                 buffers: [{
                     arrayStride: 6 * 4,
                     attributes: [
+                        // @location(0) 读位置，@location(1) 读颜色
                         { shaderLocation: 0, offset: 0, format: 'float32x3' },
                         { shaderLocation: 1, offset: 12, format: 'float32x3' }
                     ]
@@ -492,9 +512,11 @@ fn fs() -&gt; @location(0) vec4f {
             fragment: {
                 module: shader,
                 entryPoint: 'fragment_main',
+                // 输出到画布格式对应的颜色附件
                 targets: [{ format }]
             },
             primitive: { topology: 'triangle-list', cullMode: 'none' },
+            // 深度测试：让近处片段覆盖远处
             depthStencil: {
                 format: 'depth24plus',
                 depthWriteEnabled: true,
@@ -527,6 +549,7 @@ fn fs() -&gt; @location(0) vec4f {
             <pre><code>/** 矩阵乘法：a × b，列主序 */
 function mat4Multiply(a: Mat4, b: Mat4): Mat4 {
     const out = new Float32Array(16);
+    // 列主序：a[r + k*4] 是第 k 列第 r 行
     for (let c = 0; c &lt; 4; c++) {
         for (let r = 0; r &lt; 4; r++) {
             let sum = 0;
@@ -551,6 +574,7 @@ function mat4RotationY(angle: number): Mat4 {
 
 /** 透视投影：fovy 弧度、宽高比、近远平面 */
 function mat4Perspective(fovy: number, aspect: number, near: number, far: number): Mat4 {
+    // 列主序透视矩阵；-1 把 z 写入 w，供 GPU 做透视除法
     const f = 1 / Math.tan(fovy / 2);
     return new Float32Array([
         f / aspect, 0, 0, 0,
@@ -654,14 +678,17 @@ const gpuApi = (navigator as unknown as { gpu?: GpuLike }).gpu;</code></pre>
                 requestAnimationFrame(() =&gt; this.render());
                 return;
             }
+            // 1) 更新 MVP：模型旋转 + 相机 + 透视
             this.rotation += 0.01;
             const aspect = this.canvas.width / this.canvas.height;
             const projection = mat4Perspective(this.fovY, aspect, this.near, this.far);
             const view = mat4LookAt([0,0,3], [0,0,0], [0,1,0]);
             const model = mat4Multiply(mat4RotationY(this.rotation), mat4RotationX(this.rotation * 0.6));
             const mvp = mat4Multiply(mat4Multiply(projection, view), model);
+            // 2) 把新矩阵写入 Uniform 缓冲
             this.device.queue.writeBuffer(this.uniformBuffer, 0, mvp);
 
+            // 3) 编码一帧：颜色附件 + 深度附件
             const encoder = this.device.createCommandEncoder();
             const pass = encoder.beginRenderPass({
                 colorAttachments: [{
@@ -677,12 +704,14 @@ const gpuApi = (navigator as unknown as { gpu?: GpuLike }).gpu;</code></pre>
                     depthStoreOp: 'store'
                 }
             });
+            // 4) 绑定资源并绘制：管线 + Uniform + 顶点/索引缓冲
             pass.setPipeline(this.pipeline);
             pass.setBindGroup(0, this.bindGroup);
             pass.setVertexBuffer(0, this.vertexBuffer);
             pass.setIndexBuffer(this.indexBuffer, 'uint16');
             pass.drawIndexed(this.indexCount);
             pass.end();
+            // 5) 提交命令，GPU 异步执行
             this.device.queue.submit([encoder.finish()]);
 
             if (this.firstFrame.value) {
@@ -723,15 +752,19 @@ const gpuApi = (navigator as unknown as { gpu?: GpuLike }).gpu;</code></pre>
 
             <h3>8.3 WGSL Compute Kernel</h3>
             <p>每个线程计算输出矩阵的一个元素；<code>@builtin(global_invocation_id)</code> 给出线程在网格中的坐标。</p>
-            <pre><code>@group(0) @binding(0) var&lt;storage, read&gt; matrixA: array&lt;f32&gt;;
+            <pre><code>// A、B 是只读输入，C 是可写输出
+@group(0) @binding(0) var&lt;storage, read&gt; matrixA: array&lt;f32&gt;;
 @group(0) @binding(1) var&lt;storage, read&gt; matrixB: array&lt;f32&gt;;
 @group(0) @binding(2) var&lt;storage, read_write&gt; matrixC: array&lt;f32&gt;;
 
+// 一个 workgroup 只有 1 个线程；dispatch(4,4,1) 启动 16 个线程
 @compute @workgroup_size(1)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
+    // 每个线程负责输出矩阵的一个元素 (row, col)
     let row = gid.x;
     let col = gid.y;
     var sum = 0.0;
+    // 点积：A 的第 row 行 × B 的第 col 列
     for (var k = 0u; k &lt; 4u; k = k + 1u) {
         sum = sum + matrixA[row * 4u + k] * matrixB[k * 4u + col];
     }
@@ -741,11 +774,12 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
             <h3>8.4 TypeScript 侧：创建管线与调度</h3>
             <pre><code>const shader = device.createShaderModule({ code: MATMUL_SHADER });
+// 创建 compute 管线；入口是 WGSL 的 main
 const pipeline = device.createComputePipeline({
     layout: 'auto',
     compute: { module: shader, entryPoint: 'main' }
 });
-// 三个 storage buffer：A、B 为只读输入，C 为可写输出
+// 三个 storage buffer：A、B 为只读输入，C 为可写输出，对应 @binding(0/1/2)
 const bindGroup = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
     entries: [
@@ -758,8 +792,10 @@ const encoder = device.createCommandEncoder();
 const pass = encoder.beginComputePass();
 pass.setPipeline(pipeline);
 pass.setBindGroup(0, bindGroup);
+// 调度 4×4 个线程；每个线程算一个输出元素
 pass.dispatchWorkgroups(4, 4, 1);
 pass.end();
+// 回读：先拷贝到 staging，再 mapAsync
 encoder.copyBufferToBuffer(bufferC, 0, staging, 0, 64);
 device.queue.submit([encoder.finish()]);
 await staging.mapAsync(GPUMapMode.READ);
@@ -827,10 +863,12 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     for (var i = 1u; i &lt; N; i = i + 1u) {
         maxVal = max(maxVal, input[row * N + i]);
     }
+    // 第二遍：求 exp 之和
     var sum = 0.0;
     for (var i = 0u; i &lt; N; i = i + 1u) {
         sum = sum + exp(input[row * N + i] - maxVal);
     }
+    // 第三遍：归一化并写回
     for (var i = 0u; i &lt; N; i = i + 1u) {
         output[row * N + i] = exp(input[row * N + i] - maxVal) / sum;
     }
@@ -963,6 +1001,150 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             <div class="note">第一层看 kernel 怎么写，第二层看训练怎么落地，第三层学工程化框架与部署。本文所有 GitHub 链接均可点击跳转。</div>
         </section>
 
+        <!-- ========== 14 附录：API 设计哲学对比 ========== -->
+        <section class="chapter" id="api-philosophy">
+            <h2>14. 设计哲学：WebGPU 与 OpenGL / Metal / Vulkan</h2>
+            <p class="lead">WebGPU 更接近 Metal / Vulkan 的显式对象模型，但用"浏览器安全 + 强制验证 + 简化同步"换掉了裸机控制。下面从设计哲学和工程细节逐项对比。</p>
+
+            <h3>14.1 一句话定位</h3>
+            <table>
+                <tr><th>API</th><th>定位</th><th>一句话理解</th></tr>
+                <tr><td><b>OpenGL</b></td><td>跨平台、兼容旧的全局状态机图形 API</td><td>"改全局状态，然后 draw"——驱动替你做很多隐式工作。</td></tr>
+                <tr><td><b>Metal</b></td><td>Apple 平台的低开销显式图形 / 计算 API</td><td>对象化、命令缓冲、管线状态对象；与 macOS / iOS 深度绑定。</td></tr>
+                <tr><td><b>Vulkan</b></td><td>Khronos 的跨平台低开销显式 API</td><td>把内存、同步、多线程编排全部交给应用，控制力最强也最繁琐。</td></tr>
+                <tr><td><b>WebGPU</b></td><td>面向浏览器的显式、安全、可验证 API</td><td>取 Metal / Vulkan 的对象化模型，去掉裸机复杂度，并保证浏览器不被 GPU 代码搞崩。</td></tr>
+            </table>
+            <div class="note"><b>直觉</b>：WebGPU 不是"WebGL 2.0"，而是"浏览器版的 Metal / Vulkan 精简模型"。它放弃一部分底层控制，换来了安全感、可移植性和 JS 友好的异步接口。</div>
+
+            <h3>14.2 核心设计哲学</h3>
+            <table>
+                <tr><th>维度</th><th>OpenGL</th><th>Metal</th><th>Vulkan</th><th>WebGPU</th></tr>
+                <tr><td>抽象层次</td><td>较高，驱动隐藏细节</td><td>低，显式对象</td><td>极低，贴近驱动 / 硬件</td><td>中低，显式但裁剪</td></tr>
+                <tr><td>状态管理</td><td>全局可变状态机</td><td>不可变管线状态对象</td><td>不可变管线 + 显式动态状态</td><td>不可变管线 + pass 状态</td></tr>
+                <tr><td>资源生命周期</td><td>驱动托管</td><td>手动引用计数</td><td>手动分配 / 释放</td><td>JS 对象由 GC 管理，GPU 资源受 device 生命周期约束</td></tr>
+                <tr><td>同步责任</td><td>隐式，应用很少参与</td><td>显式但较克制</td><td>完全显式：barrier / semaphore / fence</td><td>大部分隐式：pass 与 dispatch 之间自动排序</td></tr>
+                <tr><td>安全模型</td><td>错误与 UB 并存，依赖驱动容错</td><td>原生代码，错误可能导致崩溃</td><td>原生代码，误用易 UB / 崩溃</td><td>强制验证、边界检查、浏览器沙箱</td></tr>
+                <tr><td>着色器语言</td><td>GLSL</td><td>MSL</td><td>GLSL → SPIR-V</td><td>WGSL</td></tr>
+                <tr><td>Compute</td><td>扩展 / OpenGL 4.3 起一等公民</td><td>一等公民</td><td>一等公民</td><td>一等公民，且与渲染共享资源模型</td></tr>
+                <tr><td>可移植性</td><td>最广的旧设备覆盖</td><td>仅 Apple 生态</td><td>Windows / Linux / Android，Apple 需 MoltenVK</td><td>现代浏览器；底层映射到 D3D12 / Metal / Vulkan</td></tr>
+                <tr><td>复杂度</td><td>API 简单但状态bug难查</td><td>中等</td><td>最高</td><td>显式 API 里最低</td></tr>
+            </table>
+            <div class="tip"><b>WebGPU 借鉴了什么</b>：从 Metal 学到"命令缓冲 + 不可变管线状态"；从 Vulkan 学到"显式布局 / 绑定 / compute 一等公民"；从 WebGL 学到"canvas 上下文 + TypedArray 上传"。但它没有照搬 Vulkan 的手动同步和裸指针式自由度。</div>
+
+            <h3>14.3 管线构建：隐式状态 vs 不可变对象</h3>
+            <table>
+                <tr><th>API</th><th>管线怎么来</th><th>特点</th></tr>
+                <tr><td><b>OpenGL</b></td><td>编译 / 链接 shader 得到 program；绘制前绑定 VAO、纹理、混合、深度等状态</td><td>管线是"当前全局状态的隐式组合"，改状态成本低，但容易状态泄漏、难缓存。</td></tr>
+                <tr><td><b>Metal</b></td><td><code>MTLRenderPipelineDescriptor</code> → <code>MTLRenderPipelineState</code></td><td>顶点格式、像素格式、深度状态在创建时固定；对象不可变，易缓存。</td></tr>
+                <tr><td><b>Vulkan</b></td><td><code>VkGraphicsPipelineCreateInfo</code> 描述每个固定阶段</td><td>最完整，也最冗长；必须与 <code>VkRenderPass</code> 子 pass 兼容；常配 pipeline cache。</td></tr>
+                <tr><td><b>WebGPU</b></td><td><code>createRenderPipeline()</code> / <code>createComputePipeline()</code></td><td>显式描述 vertex buffers、fragment targets、depthStencil；<code>layout:'auto'</code> 可自动推导绑定布局；创建即验证。</td></tr>
+            </table>
+            <p><b>WebGPU 的管线形态：</b></p>
+            <pre><code>const pipeline = device.createRenderPipeline({
+    // 自动推导绑定布局
+    layout: 'auto',
+    vertex: {
+        module: shader,
+        entryPoint: 'vs_main',
+        // 顶点布局：位置 3 float + 颜色 3 float
+        buffers: [{ arrayStride: 24, attributes: [
+            { shaderLocation: 0, offset: 0,  format: 'float32x3' },
+            { shaderLocation: 1, offset: 12, format: 'float32x3' }
+        ]}]
+    },
+    // 片段输出到画布格式
+    fragment: { module: shader, entryPoint: 'fs_main', targets: [{ format }] },
+    primitive: { topology: 'triangle-list' },
+    // 深度测试：近处覆盖远处
+    depthStencil: { format: 'depth24plus', depthCompare: 'less', depthWriteEnabled: true }
+});</code></pre>
+            <div class="note">WebGPU 的管线对象创建后不可变。视口 / scissor、混合常量等少量状态可在 pass 中动态设置；大多数配置变化需要新建管线。这与 Metal / Vulkan 更像，而与 OpenGL 的"随时改全局状态"不同。</div>
+
+            <h3>14.4 数据绑定：全局槽位 vs 显式绑定集</h3>
+            <table>
+                <tr><th>API</th><th>顶点数据</th><th>Uniform / 资源</th><th>映射方式</th></tr>
+                <tr><td><b>OpenGL</b></td><td><code>glBindBuffer</code> + <code>glVertexAttribPointer</code>，VAO 记录布局</td><td><code>glUniform*</code> / 纹理单元</td><td>全局槽位，靠"当前绑定什么"决定；状态错误常见。</td></tr>
+                <tr><td><b>Metal</b></td><td>pipeline 的 vertex descriptor 描述布局</td><td><code>setBuffer:offset:atIndex:</code>、纹理 / sampler 按 index 绑定</td><td>命令编码器显式设置；高级用法可用 argument buffer。</td></tr>
+                <tr><td><b>Vulkan</b></td><td><code>VkVertexInputBindingDescription</code> 写入管线</td><td>descriptor set layout + pool + set，push constants 用于小数据</td><td><code>@binding</code> 由应用手动组织，最灵活也最繁琐。</td></tr>
+                <tr><td><b>WebGPU</b></td><td><code>vertex.buffers[].shaderLocation</code> 对应 WGSL <code>@location</code></td><td>bind group layout + bind group，对应 <code>@group/@binding</code></td><td>创建时验证类型 / usage；没有裸指针，binding 数量有限制。</td></tr>
+            </table>
+            <p><b>WebGPU 的绑定三件套：</b></p>
+            <pre><code>// 1) 布局：声明"第 0 个 binding 是 uniform buffer"
+const layout = device.createBindGroupLayout({ entries: [{
+    binding: 0,
+    visibility: GPUShaderStage.VERTEX,
+    buffer: { type: 'uniform' }
+}]});
+
+// 2) 绑定组：把真实 buffer 填进这个插槽
+const bindGroup = device.createBindGroup({
+    layout,
+    entries: [{ binding: 0, resource: { buffer: uniformBuffer } }]
+});
+
+// 3) WGSL 侧按编号读取
+// @group(0) @binding(0) var&lt;uniform&gt; uniforms: Uniforms;</code></pre>
+            <div class="warn"><b>关键差异</b>：OpenGL 的绑定是"当前状态"，WebGPU / Vulkan / Metal 的绑定是"不可变对象 + 显式索引"。后者更啰嗦，但可验证、可缓存、可并行编码，错误也更早暴露。</div>
+
+            <h3>14.5 异步与同步：隐式驱动 vs 显式原语 vs Promise</h3>
+            <table>
+                <tr><th>API</th><th>CPU 提交</th><th>CPU 等 GPU</th><th>GPU 内部同步</th><th>队列 / 多线程</th></tr>
+                <tr><td><b>OpenGL</b></td><td>调用通常只是入队，驱动隐式批处理</td><td><code>glFinish()</code> / fence / sync object</td><td>驱动隐式插入同步</td><td>context 通常绑定单线程，跨线程困难</td></tr>
+                <tr><td><b>Metal</b></td><td><code>commitCommandBuffer</code> 提交到队列</td><td>completion handler / <code>MTLSharedEvent</code></td><td><code>MTLFence</code> / memory barrier</td><td>多线程编码命令缓冲是常规做法</td></tr>
+                <tr><td><b>Vulkan</b></td><td><code>vkQueueSubmit</code></td><td>fence / <code>vkWaitForFences</code></td><td>pipeline barrier / subpass dependency / semaphore</td><td>多 queue family，多队列并行，全部手动</td></tr>
+                <tr><td><b>WebGPU</b></td><td><code>queue.submit()</code> 同步入队，GPU 异步执行</td><td><code>onSubmittedWorkDone()</code> / <code>mapAsync()</code></td><td>pass 之间、dispatch 之间隐式排序</td><td>单一 FIFO queue；Worker 可承担计算编码，但不暴露多队列</td></tr>
+            </table>
+            <p><b>WebGPU 的异步边界：</b></p>
+            <pre><code>const adapter = await navigator.gpu.requestAdapter();   // Promise
+const device  = await adapter.requestDevice();          // Promise
+
+// 提交是同步的"入队"，实际执行由 GPU 异步完成
+device.queue.submit([encoder.finish()]);
+
+// 等待某段工作完成
+await device.queue.onSubmittedWorkDone();
+
+// 回读：copyBufferToBuffer 到 staging buffer，再异步映射
+await staging.mapAsync(GPUMapMode.READ);
+const result = new Float32Array(staging.getMappedRange()).slice();</code></pre>
+            <div class="note"><b>取舍</b>：WebGPU 没有 Vulkan 式的 semaphore / barrier，浏览器替你保证 pass 与 dispatch 的顺序和资源可见性。好处是安全、少写样板；代价是你无法表达复杂的多队列依赖，也拿不到极致控制。</div>
+
+            <h3>14.6 多线程与命令编码</h3>
+            <table>
+                <tr><th>API</th><th>命令编码模型</th><th>多线程能力</th></tr>
+                <tr><td><b>OpenGL</b></td><td>直接调用 GL 函数改变全局状态</td><td>弱；context 通常只能在创建它的线程使用。</td></tr>
+                <tr><td><b>Metal</b></td><td>每个线程创建 / 填充自己的 command buffer</td><td>强；Apple 的示例和引擎普遍并行编码。</td></tr>
+                <tr><td><b>Vulkan</b></td><td>每个线程记录自己的 command buffer，再提交到 queue</td><td>最强；也是复杂度来源之一。</td></tr>
+                <tr><td><b>WebGPU</b></td><td><code>GPUCommandEncoder</code> 一次性编码，finish 后得到 command buffer</td><td>适度；Worker 可做计算 / 预处理，但对象模型不支持 Vulkan 式多队列共享。</td></tr>
+            </table>
+
+            <h3>14.7 安全与错误处理</h3>
+            <table>
+                <tr><th>API</th><th>错误来源</th><th>处理方式</th><th>后果</th></tr>
+                <tr><td><b>OpenGL</b></td><td><code>glGetError</code>、上下文丢失、驱动 bug</td><td>轮询错误、检查扩展</td><td>可能静默错误或上下文丢失</td></tr>
+                <tr><td><b>Metal</b></td><td>API 误用、资源生命周期错误</td><td>debug validation、异常 / 崩溃日志</td><td>原生进程可能崩溃</td></tr>
+                <tr><td><b>Vulkan</b></td><td>同步错误、内存越界、生命周期错误</td><td>validation layers（可选）</td><td>UB / GPU hang / 崩溃</td></tr>
+                <tr><td><b>WebGPU</b></td><td>usage 不匹配、binding 缺失、越界</td><td>创建时验证 + <code>device.addEventListener('uncapturederror')</code> + <code>device.lost</code></td><td>操作被拒绝或设备丢失；浏览器进程保持安全</td></tr>
+            </table>
+            <div class="tip"><b>WebGPU 的安全不是"功能少"</b>：它用验证器替代了裸机自由度。比如 buffer 创建时必须声明 <code>usage</code>，shader 只能按声明访问资源，所有 binding 都要匹配类型——这些约束让"野指针式 GPU bug"在浏览器里基本不可表达。</div>
+
+            <h3>14.8 选型建议</h3>
+            <table>
+                <tr><th>场景</th><th>推荐</th><th>原因</th></tr>
+                <tr><td>浏览器可视化 / 教学 / 轻量 AI 推理</td><td><b>WebGPU</b></td><td>零安装、安全、WGSL 易上手，compute 与 render 共享模型。</td></tr>
+                <tr><td>iOS / macOS 原生高性能应用</td><td><b>Metal</b></td><td>与 Apple 生态深度整合，工具链与性能调优最成熟。</td></tr>
+                <tr><td>跨平台引擎 / 主机级控制</td><td><b>Vulkan</b></td><td>多队列、显式内存与同步，适合榨干硬件。</td></tr>
+                <tr><td>旧设备 / 老项目兼容</td><td><b>OpenGL / WebGL</b></td><td>覆盖面广，但状态机模型已不代表现代 GPU 工作方式。</td></tr>
+                <tr><td>想系统理解现代图形 API</td><td><b>WebGPU → Metal / Vulkan</b></td><td>先用 WebGPU 建立对象化直觉，再看 Vulkan / Metal 多出来的显式控制。</td></tr>
+            </table>
+            <div class="flow">
+                <span class="node">WebGPU 入门</span><span class="arrow">→</span>
+                <span class="node cpu">理解管线 / 绑定 / 命令缓冲</span><span class="arrow">→</span>
+                <span class="node cpu">对照 Metal / Vulkan 的显式原语</span><span class="arrow">→</span>
+                <span class="node gpu">看懂 WebGPU 替你省略了什么</span>
+            </div>
+            <div class="note">本指南前 13 章的 WGSL、管线、绑定、compute 与 AI 示例，都是在训练这套"显式 GPU 思维"。理解本章对比后，再回看第 5 章的数据流，会更清楚 WebGPU 为什么这样设计。</div>
+        </section>
     </main>
 
     <aside class="demo-panel" style="width:320px;flex-shrink:0;">
